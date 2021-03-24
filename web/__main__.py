@@ -6,8 +6,9 @@ See: https://github.com/seasalt-ai/snowboy
 """
 import argparse
 import asyncio
+import base64
 import logging
-import shutil
+import os
 import signal
 import tempfile
 import typing
@@ -20,10 +21,9 @@ import quart_cors
 from quart import (
     Quart,
     Response,
-    render_template,
     request,
     send_file,
-    send_from_directory,
+    send_from_directory, abort,
 )
 
 from .utils import trim_silence
@@ -33,12 +33,15 @@ _LOOP = asyncio.get_event_loop()
 
 web_dir = Path(__file__).parent
 
+EXPECTED_API_TOKEN = os.getenv('SNOWBOY_API_TOKEN', '3a4961e07b2a0c38772ad0e8ae350c7a124182da02d6')
+
+
 # -----------------------------------------------------------------------------
 
 
 def parse_args():
     """Parse command-line arguments"""
-    parser = argparse.ArgumentParser("snowboy-seasalt")
+    parser = argparse.ArgumentParser("snowboy-api")
     parser.add_argument(
         "--host", type=str, help="Host for web server", default="0.0.0.0"
     )
@@ -81,23 +84,16 @@ assert _GENERATE_PMDL.is_file(), f"Missing {_GENERATE_PMDL}"
 # Quart App
 # -----------------------------------------------------------------------------
 
-app = Quart("snowboy-seasalt", template_folder=str(web_dir / "templates"))
+app = Quart("snowboy-api", template_folder=str(web_dir / "templates"))
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 app.secret_key = str(uuid4())
 app = quart_cors.cors(app)
 
+
 # -----------------------------------------------------------------------------
 # Template Functions
 # -----------------------------------------------------------------------------
-
-
-@app.route("/")
-@app.route("/index.html")
-async def api_index() -> str:
-    """Main page"""
-    return await render_template("index.html")
-
 
 # -----------------------------------------------------------------------------
 
@@ -105,78 +101,94 @@ async def api_index() -> str:
 @app.route("/generate", methods=["POST"])
 async def api_generate() -> Response:
     """Generate personal model from submitted audio"""
-    form = await request.form
-    model_name = request.args.get("modelName") or form.get("modelName")
-    assert model_name, "No modelName"
-    lang = request.args.get("lang") or form.get("lang") or ""
+    payload = await request.get_json()
+
+    if not payload:
+        abort(400)
+
+    if payload.get('token', '') != EXPECTED_API_TOKEN:
+        abort(401)
+
+    model_name = payload.get("name")
+    assert model_name, "No model name"
+    lang = payload.get("lang") or ""
 
     # If true, silence is not trimmed
-    no_trim = (
-        request.args.get("noTrim") or form.get("noTrim") or ""
-    ).strip().lower() in ("true", "1")
+    no_trim = False
 
     # Create directory to store submitted audio
     model_dir = _TEMP_DIR / model_name
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    files = await request.files
-    assert len(files) > 2, f"At least 2 examples are required (got {len(files)})"
+    voice_samples = payload.get('voice_samples', [])
+    files = []
+    for i, sample in enumerate(voice_samples):
+        print(i)
+        print(sample)
+        file_name = f'{model_dir}_{i}.wav'
+        with open(file_name, 'wb') as f:
+            f.write(base64.b64decode(sample['wave']))
+
+        if os.path.exists(file_name):
+            files.append(file_name)
+
+    assert len(files) > 2, f"3 voice samples are required (got {len(files)})"
 
     # Paths to 16 Khz 16-bit mono WAV files
     wav_paths = []
 
-    for file_name, form_file in files.items():
+    for file_name in files:
         _LOGGER.debug("Processing %s for %s", file_name, model_name)
+        with open(file_name, 'rb') as file_data:
+            with tempfile.NamedTemporaryFile(mode="wb+") as original_audio_file:
+                # Original audio should be webm or wav
+                original_audio_file.write(file_data.read().strip())
 
-        with tempfile.NamedTemporaryFile(mode="wb+") as original_audio_file:
-            # Original audio should be webm or wav
-            form_file.save(original_audio_file)
+                # Rewind
+                original_audio_file.seek(0)
+                with tempfile.NamedTemporaryFile(
+                        mode="wb+", dir=model_dir, suffix=".wav", delete=False
+                ) as wav_file:
+                    # Convert to 16Khz 16-bit mono WAV
+                    ffmpeg_cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(file_name),
+                        "-acodec",
+                        "pcm_s16le",
+                        "-ar",
+                        "16000",
+                        "-ac",
+                        "1",
+                        "-f",
+                        "s16le",
+                        "-",
+                    ]
 
-            # Rewind
-            original_audio_file.seek(0)
-            with tempfile.NamedTemporaryFile(
-                mode="wb+", dir=model_dir, suffix=".wav", delete=False
-            ) as wav_file:
-                # Convert to 16Khz 16-bit mono WAV
-                ffmpeg_cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(original_audio_file.name),
-                    "-acodec",
-                    "pcm_s16le",
-                    "-ar",
-                    "16000",
-                    "-ac",
-                    "1",
-                    "-f",
-                    "s16le",
-                    "-",
-                ]
+                    _LOGGER.debug(ffmpeg_cmd)
+                    proc = await asyncio.create_subprocess_exec(
+                        *ffmpeg_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    audio_bytes, stderr = await proc.communicate()
+                    if stderr:
+                        _LOGGER.error(stderr)
 
-                _LOGGER.debug(ffmpeg_cmd)
-                proc = await asyncio.create_subprocess_exec(
-                    *ffmpeg_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                audio_bytes, stderr = await proc.communicate()
-                if stderr:
-                    _LOGGER.error(stderr)
+                    if not no_trim:
+                        audio_bytes = trim_silence(audio_bytes)
 
-                if not no_trim:
-                    audio_bytes = trim_silence(audio_bytes)
+                    # Write final WAV file
+                    wav_io: wave.Wave_write = wave.open(wav_file.name, "wb")
+                    with wav_io:
+                        wav_io.setframerate(16000)
+                        wav_io.setsampwidth(2)
+                        wav_io.setnchannels(1)
+                        wav_io.writeframes(audio_bytes)
 
-                # Write final WAV file
-                wav_io: wave.Wave_write = wave.open(wav_file.name, "wb")
-                with wav_io:
-                    wav_io.setframerate(16000)
-                    wav_io.setsampwidth(2)
-                    wav_io.setnchannels(1)
-                    wav_io.writeframes(audio_bytes)
-
-                wav_file.seek(0)
-                wav_paths.append(wav_file.name)
+                    wav_file.seek(0)
+                    wav_paths.append(wav_file.name)
 
     if len(wav_paths) > 3:
         _LOGGER.warning(
@@ -208,17 +220,17 @@ async def api_generate() -> Response:
     return await send_file(model_path, as_attachment=True)
 
 
-@app.route("/delete", methods=["POST"])
-async def api_delete() -> Response:
-    """Delete audio for a model"""
-    model_name = request.args.get("modelName")
-    if model_name:
-        model_dir = _TEMP_DIR / model_name
-        if model_dir.is_dir():
-            _LOGGER.debug("Deleting %s", model_dir)
-            shutil.rmtree(model_dir)
-
-    return model_name
+# @app.route("/delete", methods=["POST"])
+# async def api_delete() -> Response:
+#     """Delete audio for a model"""
+#     model_name = request.args.get("modelName")
+#     if model_name:
+#         model_dir = _TEMP_DIR / model_name
+#         if model_dir.is_dir():
+#             _LOGGER.debug("Deleting %s", model_dir)
+#             shutil.rmtree(model_dir)
+#
+#     return model_name
 
 
 # ---------------------------------------------------------------------

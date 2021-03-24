@@ -1,4 +1,30 @@
-# Snowboy Personal Wake Word Recorder
+# Snowboy API
+
+Emulate the following API from previously deprecated hotword as a service system.
+
+```
+{
+    "name": "a word",
+    "language": "en",
+    "age_group": "10_19",
+    "gender": "F",
+    "microphone": "mic type",
+    "token": "<your auth token>",
+    "voice_samples": [
+        {wave: "<base64 encoded wave data>"},
+        {wave: "<base64 encoded wave data>"},
+        {wave: "<base64 encoded wave data>"}
+    ]
+}
+```
+
+References: 
+
+* https://github.com/Kitt-AI/snowboy/#hotword-as-a-service
+* http://docs.kitt.ai/snowboy/#api-v1-train
+
+
+# Forked from Snowboy Personal Wake Word Recorder
 
 Docker-based web interface for generating `.pmdl` files from audio examples for [snowboy](https://github.com/Kitt-AI/snowboy).
 
